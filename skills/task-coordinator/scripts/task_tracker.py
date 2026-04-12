@@ -34,6 +34,29 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 TRACE_DIR = Path(os.path.expanduser(os.environ.get("TASK_TRACE_DIR", "~/.openclaw/workspace/data/task-traces")))
+DEFAULT_NOTIFY_USER = os.environ.get("DEFAULT_NOTIFY_USER", "")
+
+# 尝试从 USER.md 读取默认通知人
+def _load_default_notify_user() -> str:
+    global DEFAULT_NOTIFY_USER
+    if DEFAULT_NOTIFY_USER:
+        return DEFAULT_NOTIFY_USER
+    for candidate in [
+        Path.home() / ".openclaw" / "workspace" / "USER.md",
+        Path(os.environ.get("OPENCLAW_WORKSPACE", "")) / "USER.md",
+    ]:
+        if candidate.exists():
+            text = candidate.read_text()
+            for line in text.splitlines():
+                if "open_id" in line.lower() and "ou_" in line:
+                    import re
+                    m = re.search(r"ou_[a-f0-9]+", line)
+                    if m:
+                        DEFAULT_NOTIFY_USER = m.group()
+                        return DEFAULT_NOTIFY_USER
+    return ""
+
+DEFAULT_NOTIFY_USER = _load_default_notify_user()
 CST = timezone(timedelta(hours=8))
 
 # 结果截断长度
@@ -514,32 +537,36 @@ def _notify_user_and_wake_session(task_id: str, signal_type: str, data: dict):
 
     # 1. Wake LLM session
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["/opt/homebrew/bin/openclaw", "system", "event",
              "--mode", "now", "--text", event_text, "--timeout", "10000"],
             capture_output=True, text=True, timeout=15
         )
-        _watch_log(f"WAKE_SENT: {task_id} via system event")
+        _watch_log(f"WAKE_SENT: {task_id} via system event (exit={result.returncode} stdout={result.stdout.strip()[:300]} stderr={result.stderr.strip()[:300]})")
     except Exception as e:
         _watch_log(f"WAKE_FAILED: {task_id} - {e}")
 
-    # 2. Notify user (feishu) — only if notify_target is set
+    # 2. Notify user (feishu) — use task-level notify_user, then global default
+    if not notify_target:
+        if DEFAULT_NOTIFY_USER:
+            notify_target = DEFAULT_NOTIFY_USER
+            _watch_log(f"USER_NOTIFY_FALLBACK: {task_id} using DEFAULT_NOTIFY_USER={DEFAULT_NOTIFY_USER}")
     if notify_target:
         try:
             target = f"user:{notify_target}" if ":" not in notify_target else notify_target
             msg = f"{emoji} {title}: {goal}\n{detail}"
-            subprocess.run(
+            result = subprocess.run(
                 ["/opt/homebrew/bin/openclaw", "message", "send",
                  "--channel", "feishu",
                  "--target", target,
                  "--message", msg],
                 capture_output=True, text=True, timeout=10
             )
-            _watch_log(f"USER_NOTIFIED: {task_id} -> {target}")
+            _watch_log(f"USER_NOTIFIED: {task_id} -> {target} (exit={result.returncode} stdout={result.stdout.strip()[:200]} stderr={result.stderr.strip()[:200]})")
         except Exception as e:
             _watch_log(f"USER_NOTIFY_FAILED: {task_id} - {e}")
     else:
-        _watch_log(f"USER_NOTIFY_SKIPPED: {task_id} (no notify_user in task_plan)")
+        _watch_log(f"USER_NOTIFY_SKIPPED: {task_id} (no notify_user in task_plan, no DEFAULT_NOTIFY_USER set)")
 
 
 
