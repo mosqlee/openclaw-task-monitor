@@ -12,7 +12,29 @@
 - 📊 **轨迹检索**：查询历史任务，借鉴成功经验，避免重复踩坑
 - 📢 **主动通知**：通过飞书/OpenClaw event 主动唤醒处理
 
-## 系统架构
+## 系统架构概览
+
+整个系统分**两层监控**，互补工作：
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Layer 1: progress-monitor (OpenClaw 插件)               │
+│  ─ 原生 hook 集成，自动追踪所有 spawn + 后台 exec        │
+│  ─ 毫秒级精度，随 OpenClaw 启动自动加载                  │
+│  ─ 停滞时写 signal 文件 + 请求立即心跳                    │
+└──────────────────┬───────────────────────────────────────┘
+                   │ signal 文件
+┌──────────────────▼───────────────────────────────────────┐
+│  Layer 2: task-coordinator (Skill + Watch Daemon)        │
+│  ─ 需要主动 init，追踪粒度更细（步骤、工具调用、Prompt）   │
+│  ─ Watch Daemon 独立进程，持续扫描停滞/超时               │
+│  ─ 直接发飞书通知 + 写 result.json 兜底                   │
+└──────────────────────────────────────────────────────────┘
+```
+
+**简单来说**：progress-monitor 是**被动安全网**（自动兜底），task-coordinator 是**主动追踪**（手动但更细）。两者协同工作。
+
+## 系统架构（详细）
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -97,19 +119,41 @@
 
 > ⚠️ **重要**: 停滞/超时通知是 Watch Daemon **直接发送**的，不经过 Heartbeat。Heartbeat 只负责保活和 Signal 收集。
 
-### 4. Heartbeat 集成
+### 4. progress-monitor（OpenClaw 插件）
+
+**位置**: `plugin/progress-monitor/`
+
+这是 OpenClaw 的原生插件，通过 `openclaw plugin` 机制加载。**无需手动 init，自动追踪所有 spawn 和后台 exec 调用**。
+
+监听的事件：
+
+| OpenClaw 事件 | 触发时机 | 插件动作 |
+|---------------|---------|--------|
+| `subagent_spawned` | `sessions_spawn` 调用后 | 记录任务 + 启动 5min 计时器 |
+| `subagent_ended` | SubAgent 完成/失败 | 清理计时器 |
+| `before_tool_call` | 检测到后台 `exec` | 记录 exec 任务 |
+| `after_tool_call` | 后台 exec 启动后 | 开始停滞计时 |
+| `agent_end` | 主 Agent 一轮对话结束 | 重置所有关联计时器（表明主 Agent 还活着） |
+| `gateway_start` | OpenClaw 网关启动 | 恢复未完成任务 | 
+
+停滞时：写 signal 文件 → 请求立即心跳 → AI 读取后处理。
+
+> ⚠️ progress-monitor 只写 signal，不直接发飞书通知。飞书通知由 Watch Daemon 或 AI 在处理 signal 时发送。
+
+### 5. Heartbeat 集成
 
 Heartbeat **不参与实时监控**，仅负责两件事：
 1. **Watch Daemon 保活**: 心跳时检查进程是否存活，挂了就自动重启
-2. **Signal 收集**: 心跳时收集所有 signal 文件到 `_heartbeat_pending.json`，供 AI 读取后做进一步处理
+2. **Signal 收集**: 收集 progress-monitor 和 Watch Daemon 两种来源的 signal 文件，供 AI 读取后做进一步处理
 
-> 即使 Heartbeat 完全关闭，Watch Daemon 的停滞检测和飞书通知仍然正常工作。
+> 即使 Heartbeat 完全关闭，Watch Daemon 的飞书通知仍然正常工作。但 progress-monitor 的 signal 需要心跳或 Watch Daemon 来处理。
 
 ## 快速开始
 
 ### 前提条件
 
 - Python 3.8+
+- Node.js 16+
 - OpenClaw 已安装（`openclaw` CLI 可用）
 - 已配置 OpenClaw workspace（默认 `~/.openclaw/workspace`）
 
@@ -128,6 +172,7 @@ bash scripts/setup.sh /path/to/your/openclaw/workspace
 ```
 
 安装脚本会自动：
+- ✅ 安装 progress-monitor 插件到 OpenClaw extensions
 - ✅ 创建目录结构
 - ✅ 复制 Skill 文件到 workspace
 - ✅ 初始化数据目录
@@ -136,6 +181,15 @@ bash scripts/setup.sh /path/to/your/openclaw/workspace
 ### 手动安装
 
 ```bash
+# 0. 安装 progress-monitor 插件
+OPENCLAW_DIR=~/.openclaw
+PLUGIN_DIR=$OPENCLAW_DIR/extensions/progress-monitor
+mkdir -p $PLUGIN_DIR
+cp plugin/openclaw.plugin.json plugin/index.js $PLUGIN_DIR/
+
+# 在 openclaw.json 中添加到 plugins.allow（如果没有的话）
+# "plugins": { "allow": ["progress-monitor"] }
+
 # 1. 创建目录
 WORKSPACE=~/.openclaw/workspace
 mkdir -p $WORKSPACE/skills/task-coordinator/scripts
@@ -262,6 +316,9 @@ python3 -m pytest test_task_tracker.py -v
 openclaw-task-monitor/
 ├── README.md                          # 本文件
 ├── LICENSE                            # MIT 许可证
+├── plugin/
+│   ├── openclaw.plugin.json           # progress-monitor 插件元数据
+│   └── index.js                       # progress-monitor 插件逻辑
 ├── skills/
 │   ├── task-coordinator/
 │   │   ├── SKILL.md                   # Skill 元数据和使用说明
@@ -294,7 +351,9 @@ openclaw-task-monitor/
 
 ## 注意事项
 
-1. **Watch Daemon 是独立进程**: 停滞检测和飞书通知不依赖 Heartbeat。Heartbeat 仅负责保活和 Signal 收集，即使关闭 Heartbeat，监控仍然正常工作
+1. **Watch Daemon 是独立进程**: 停滞检测和飞书通知不依赖 Heartbeat。Heartbeat 仅负责保活和 Signal 收集，即使关闭 Heartbeat，Watch Daemon 的飞书通知仍然正常工作
+2. **progress-monitor 需要 OpenClaw 重启**: 安装/更新插件后需要重启 OpenClaw gateway（`openclaw gateway restart`）才能生效
+3. **两层监控互补**: progress-monitor 自动兜底所有 spawn/exec，task-coordinator 提供细粒度手动追踪
 2. **Signal 清理**: 心跳会自动收集并清理 signal 文件，不需要手动清理
 3. **数据清理**: 定期运行 `cleanup` 命令清理过期记录（默认保留72小时）
 4. **PID 文件**: Watch Daemon 的 PID 文件在 `data/task-traces/watch.pid`，进程异常退出时可能残留，重启前确认无残留进程

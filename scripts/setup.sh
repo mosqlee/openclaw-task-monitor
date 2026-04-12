@@ -14,7 +14,7 @@ echo ""
 
 # 检查依赖
 echo "📋 检查依赖..."
-for cmd in python3 git gh; do
+for cmd in python3 git gh node; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "❌ 缺少依赖: $cmd"
         echo "请先安装 $cmd"
@@ -23,11 +23,10 @@ for cmd in python3 git gh; do
 done
 echo "✅ 依赖检查通过"
 
-# 检查 OpenClaw workspace
-if [ ! -d "$WORKSPACE" ]; then
-    echo "❌ OpenClaw workspace 不存在: $WORKSPACE"
-    echo "请确认 OpenClaw 已正确安装"
-    exit 1
+# 检查 OpenClaw 是否在运行
+OPENCLAW_DIR="${WORKSPACE}/../.."
+if [ ! -d "$OPENCLAW_DIR/extensions" ]; then
+    OPENCLAW_DIR="$HOME/.openclaw"
 fi
 
 # 创建目录结构
@@ -37,7 +36,37 @@ mkdir -p "$WORKSPACE/skills/task-coordinator/scripts"
 mkdir -p "$WORKSPACE/skills/trace-query/scripts"
 mkdir -p "$WORKSPACE/data/task-traces"
 mkdir -p "$WORKSPACE/data/signals"
+mkdir -p "$OPENCLAW_DIR/extensions/progress-monitor"
 echo "✅ 目录结构创建完成"
+
+# 安装 progress-monitor 插件
+echo ""
+echo "🔌 安装 progress-monitor 插件..."
+cp "$PROJECT_DIR/plugin/openclaw.plugin.json" "$OPENCLAW_DIR/extensions/progress-monitor/"
+cp "$PROJECT_DIR/plugin/index.js" "$OPENCLAW_DIR/extensions/progress-monitor/"
+
+# 确保 openclaw.json 的 plugins.allow 包含 progress-monitor
+OPENCLAW_CONFIG="$OPENCLAW_DIR/openclaw.json"
+if [ -f "$OPENCLAW_CONFIG" ]; then
+    # 使用 node 来安全地修改 JSON
+    node -e "
+const fs = require('fs');
+const cfg = JSON.parse(fs.readFileSync('$OPENCLAW_CONFIG', 'utf8'));
+const allow = (cfg.plugins && cfg.plugins.allow) || [];
+if (!allow.includes('progress-monitor')) {
+    allow.push('progress-monitor');
+    cfg.plugins = cfg.plugins || {};
+    cfg.plugins.allow = allow;
+    fs.writeFileSync('$OPENCLAW_CONFIG', JSON.stringify(cfg, null, 2));
+    console.log('Added progress-monitor to plugins.allow');
+} else {
+    console.log('progress-monitor already in plugins.allow');
+}
+" 2>/dev/null || echo "⚠️  无法自动修改 openclaw.json，请手动添加 \"progress-monitor\" 到 plugins.allow"
+else
+    echo "⚠️  openclaw.json 不存在，请手动配置 plugins.allow 包含 progress-monitor"
+fi
+echo "✅ progress-monitor 插件安装完成"
 
 # 复制文件
 echo ""
@@ -128,10 +157,12 @@ fi
 echo ""
 echo "🎉 安装完成！"
 echo ""
-echo "📌 后续配置："
-echo "  1. 在 AGENTS.md 中添加 spawn subagent checklist（参考 config/AGENTS_SNIPPET.md）"
-echo "  2. 如需飞书通知，在 task-coordinator init 时传入 --notify-user <open_id>"
-echo "  3. Watch Daemon 阈值可在 HEARTBEAT.md 的 WATCHER_BIN 中调整："
+echo "📌 后续操作："
+echo "  1. 重启 OpenClaw Gateway 以加载 progress-monitor 插件："
+echo "     openclaw gateway restart"
+echo "  2. 在 AGENTS.md 中添加 spawn subagent checklist（参考 config/AGENTS_SNIPPET.md）"
+echo "  3. 如需飞书通知，Watch Daemon 会自动从 USER.md 读取 open_id"
+echo "  4. Watch Daemon 阈值可在 HEARTBEAT.md 的 WATCHER_BIN 中调整："
 echo "     --interval 60      扫描间隔（秒）"
 echo "     --stale-threshold 300  停滞告警阈值（秒）"
 echo "     --timeout 600      超时阈值（秒）"

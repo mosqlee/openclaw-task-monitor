@@ -1,0 +1,37 @@
+{
+  "id": "progress-monitor",
+  "name": "Progress Monitor",
+  "description": "Monitor subagent progress and notify on stale tasks",
+  "version": "1.0.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "staleTimeoutMs": {
+        "type": "number",
+        "default": 300000,
+        "description": "Stale task timeout in milliseconds (default: 5 min)"
+      },
+      "userOpenId": {
+        "type": "string",
+        "default": "ou_3fe124f0786a0d7da47d46191695efe4",
+        "description": "Feishu user open_id for notifications"
+      },
+      "signalDir": {
+        "type": "string",
+        "default": "~/.openclaw/workspace/data/signals",
+        "description": "Directory for fallback signal files"
+      },
+      "execStaleTimeoutMs": {
+        "type": "number",
+        "default": 300000,
+        "description": "Exec stale task timeout in milliseconds (default: 5 min)"
+      },
+      "execMinDurationMs": {
+        "type": "number",
+        "default": 60000,
+        "description": "Minimum exec duration before monitoring kicks in (default: 1 min)"
+      }
+    }
+  }
+}
