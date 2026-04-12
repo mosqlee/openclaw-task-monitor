@@ -42,8 +42,9 @@
                        │
                  ┌─────▼──────┐
                  │  HEARTBEAT  │
-                 │  收集信号    │
-                 │  → 通知用户  │
+                 │  仅负责：    │
+                 │  ① Daemon 保活│
+                 │  ② Signal 收集│
                  └────────────┘
 ```
 
@@ -87,17 +88,22 @@
 
 ### 3. Watch Daemon（后台守护进程）
 
-通过 HEARTBEAT.md 配置自动启动，持续监控所有 running 状态的任务：
+**独立后台进程**，不依赖 Heartbeat 进行实时监控。每 60 秒扫描一次所有 running 状态的任务：
 
-- **停滞告警**: 5分钟无新 checkpoint → 写 signal → 唤醒 LLM + 飞书通知
-- **超时兜底**: 10分钟无响应 → 自动标记 timeout + 生成报告
+- **停滞告警**: 5分钟无新 checkpoint → **直接发飞书通知** + 写 signal + 唤醒 LLM
+- **超时兜底**: 10分钟无响应 → **直接发飞书通知** + 自动标记 timeout + 生成报告
 - **恢复检测**: 停滞任务恢复后自动清理告警状态
+- **通知人**: 自动从 `USER.md` 读取默认 open_id，也可通过 `DEFAULT_NOTIFY_USER` 环境变量或 `--notify-user` 参数指定
+
+> ⚠️ **重要**: 停滞/超时通知是 Watch Daemon **直接发送**的，不经过 Heartbeat。Heartbeat 只负责保活和 Signal 收集。
 
 ### 4. Heartbeat 集成
 
-在 `HEARTBEAT.md` 中配置两件事：
-1. **Watch Daemon 保活**: 心跳时检查进程是否存活，不存活则重启
-2. **Signal 收集**: 心跳时收集所有 signal 文件，AI 读取后决定如何处理
+Heartbeat **不参与实时监控**，仅负责两件事：
+1. **Watch Daemon 保活**: 心跳时检查进程是否存活，挂了就自动重启
+2. **Signal 收集**: 心跳时收集所有 signal 文件到 `_heartbeat_pending.json`，供 AI 读取后做进一步处理
+
+> 即使 Heartbeat 完全关闭，Watch Daemon 的停滞检测和飞书通知仍然正常工作。
 
 ## 快速开始
 
@@ -232,13 +238,14 @@ python3 skills/trace-query/scripts/query_api.py failures
 
 ### 飞书通知
 
-在 `init` 时传入 `--notify-user` 指定接收告警的用户 open_id：
+Watch Daemon 检测到停滞/超时时，会自动发送飞书通知。通知人的确定顺序：
 
-```bash
-python3 skills/task-coordinator/scripts/task_tracker.py init \
-  "$TASK_ID" "任务目标" "agent" \
-  --notify-user "ou_xxxxxxxxxxxx"
-```
+1. `task init --notify-user` 指定的 open_id
+2. `DEFAULT_NOTIFY_USER` 环境变量
+3. 从 `~/.openclaw/workspace/USER.md` 自动解析 `ou_xxx` 开头的 open_id
+4. 以上都没有则跳过通知（记录到 watch.log）
+
+大多数情况下**不需要任何配置**，只要 USER.md 里包含你的 open_id 即可。
 
 ## 开发指南
 
@@ -287,7 +294,7 @@ openclaw-task-monitor/
 
 ## 注意事项
 
-1. **Watch Daemon 依赖 HEARTBEAT**: Watch Daemon 的保活检查写在 HEARTBEAT.md 中，确保你的 OpenClaw 配置启用了心跳
+1. **Watch Daemon 是独立进程**: 停滞检测和飞书通知不依赖 Heartbeat。Heartbeat 仅负责保活和 Signal 收集，即使关闭 Heartbeat，监控仍然正常工作
 2. **Signal 清理**: 心跳会自动收集并清理 signal 文件，不需要手动清理
 3. **数据清理**: 定期运行 `cleanup` 命令清理过期记录（默认保留72小时）
 4. **PID 文件**: Watch Daemon 的 PID 文件在 `data/task-traces/watch.pid`，进程异常退出时可能残留，重启前确认无残留进程
