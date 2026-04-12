@@ -1,0 +1,6 @@
+{
+  "name": "trace-query",
+  "version": "1.0.0",
+  "type": "skill",
+  "description": "任务轨迹检索接口，查询相似成功任务和失败模式分析"
+}

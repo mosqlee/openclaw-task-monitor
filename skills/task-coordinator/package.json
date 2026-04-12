@@ -1,0 +1,6 @@
+{
+  "name": "task-coordinator",
+  "version": "1.0.0",
+  "type": "skill",
+  "description": "任务追踪与超时兜底，每次spawn subagent前自动创建追踪"
+}
