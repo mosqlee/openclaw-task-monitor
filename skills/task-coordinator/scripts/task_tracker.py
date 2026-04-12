@@ -57,6 +57,33 @@ def _load_default_notify_user() -> str:
     return ""
 
 DEFAULT_NOTIFY_USER = _load_default_notify_user()
+
+
+def _resolve_notify_target(requester_session_key: str = "") -> str:
+    """从 sessionKey 解析通知目标
+
+    格式示例:
+      agent:main:feishu:direct:ou_xxx  → user:ou_xxx
+      agent:main:feishu:group:oc_xxx   → chat:oc_xxx
+      agent:main:web:xxx               → (无法解析)
+    """
+    if not requester_session_key:
+        return ""
+    parts = requester_session_key.split(":")
+    # 寻找 channel 和 target_type
+    try:
+        # 格式: agent:{agent_id}:{channel}:{type}:{target}
+        # 或:   agent:{agent_id}:{channel}:{type}
+        if len(parts) >= 5 and parts[2] == "feishu":
+            target_type = parts[3]  # direct / group
+            target_id = parts[4]   # ou_xxx / oc_xxx
+            if target_type == "direct" and target_id.startswith("ou_"):
+                return f"user:{target_id}"
+            elif target_type == "group" and target_id.startswith("oc_"):
+                return f"chat:{target_id}"
+    except (IndexError, ValueError):
+        pass
+    return ""
 CST = timezone(timedelta(hours=8))
 
 # 结果截断长度
@@ -103,6 +130,7 @@ def cmd_init(args):
         "goal": args.goal,
         "agent": args.agent,
         "notify_user": getattr(args, "notify_user", ""),
+        "requester": getattr(args, "requester", ""),
         "created_at": now_str(),
         "status": "running",
         "steps": [
@@ -511,10 +539,22 @@ def _notify_user_and_wake_session(task_id: str, signal_type: str, data: dict):
     elapsed_min = data.get("elapsed_min", 0)
     last_step = data.get("last_step", "")
 
-    # Read notify_user from task_plan
+    # Resolve notify target (priority: task_plan.notify_user > requester session > default)
     tp = load_file(task_id, "task_plan.json")
-    notify_target = (tp or {}).get("notify_user", "")
-    notify_target = notify_target.strip()
+    notify_target = ""
+    if tp:
+        notify_target = (tp.get("notify_user") or "").strip()
+    if not notify_target:
+        # 从 requester session key 解析
+        requester = (tp or {}).get("requester", "") if tp else ""
+        resolved = _resolve_notify_target(requester)
+        if resolved:
+            notify_target = resolved
+            _watch_log(f"NOTIFY_RESOLVED_FROM_REQUESTER: {task_id} requester={requester} -> {resolved}")
+    if not notify_target:
+        if DEFAULT_NOTIFY_USER:
+            notify_target = DEFAULT_NOTIFY_USER
+            _watch_log(f"NOTIFY_FALLBACK_DEFAULT: {task_id} using DEFAULT_NOTIFY_USER={DEFAULT_NOTIFY_USER}")
 
     if signal_type == "stale":
         emoji, title = "⏰", "任务停滞"
@@ -760,7 +800,8 @@ def main():
     p.add_argument("goal")
     p.add_argument("agent")
     p.add_argument("--steps", default="")
-    p.add_argument("--notify-user", type=str, default="", help="User/group open_id to notify on stale/timeout")
+    p.add_argument("--notify-user", type=str, default="", help="User/group open_id to notify on stale/timeout (fallback)")
+    p.add_argument("--requester", type=str, default="", help="Requester session key for auto-resolving notify target")
 
     # checkpoint
     p = sub.add_parser("checkpoint")

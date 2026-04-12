@@ -2,6 +2,7 @@
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const { execSync } = require("child_process");
 
 const TRACE_FILE = path.join(os.homedir(), ".openclaw/workspace/data/task-traces/plugin-tracked.json");
 const DEBUG_FILE = path.join(os.homedir(), ".openclaw/workspace/data/task-traces/plugin-debug.log");
@@ -31,6 +32,65 @@ function debugLog(msg) {
   } catch {}
 }
 
+/**
+ * 从 requesterSessionKey 解析通知目标
+ * 格式: agent:{agent_id}:{channel}:{type}:{target}
+ *   agent:main:feishu:direct:ou_xxx  → user:ou_xxx
+ *   agent:main:feishu:group:oc_xxx   → chat:oc_xxx
+ *   agent:main:web:xxx               → "" (无法解析)
+ */
+function resolveNotifyTarget(requesterSessionKey) {
+  if (!requesterSessionKey) return "";
+  const parts = requesterSessionKey.split(":");
+  try {
+    if (parts.length >= 5 && parts[2] === "feishu") {
+      const targetType = parts[3]; // direct / group
+      const targetId = parts[4];   // ou_xxx / oc_xxx
+      if (targetType === "direct" && targetId.startsWith("ou_")) {
+        return `user:${targetId}`;
+      }
+      if (targetType === "group" && targetId.startsWith("oc_")) {
+        return `chat:${targetId}`;
+      }
+    }
+  } catch {}
+  return "";
+}
+
+/**
+ * 获取通知目标（优先级: requesterSessionKey 解析 > userOpenId 配置）
+ */
+function getNotifyTarget(task) {
+  // 1. 从 requesterSessionKey 解析
+  const fromRequester = resolveNotifyTarget(task.requesterSessionKey);
+  if (fromRequester) {
+    debugLog(`NOTIFY_RESOLVED: ${task.childSessionKey} from requester -> ${fromRequester}`);
+    return fromRequester;
+  }
+  // 2. 使用插件配置的默认 userOpenId
+  const defaultUser = cfg?.userOpenId || "";
+  if (defaultUser) {
+    debugLog(`NOTIFY_FALLBACK: ${task.childSessionKey} using userOpenId=${defaultUser}`);
+    return `user:${defaultUser}`;
+  }
+  debugLog(`NOTIFY_NONE: ${task.childSessionKey} no target resolved`);
+  return "";
+}
+
+function sendFeishuNotification(target, emoji, title, message) {
+  if (!target) return;
+  try {
+    const fullMsg = `${emoji} ${title}: ${message}`;
+    const result = execSync(
+      `openclaw message send --channel feishu --target "${target}" --message '${fullMsg.replace(/'/g, "'\"'\"'")}'`,
+      { timeout: 10000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
+    );
+    debugLog(`FEISHU_SENT: to=${target} exit=0 stdout=${result.trim().slice(0, 200)}`);
+  } catch (e) {
+    debugLog(`FEISHU_FAILED: to=${target} error=${e.message?.slice(0, 200)}`);
+  }
+}
+
 function staleNotify(task, elapsed, signalDir) {
   const dir = expandDir(signalDir);
   try {
@@ -51,6 +111,16 @@ function staleNotify(task, elapsed, signalDir) {
       : `stale-${task.childSessionKey}-${Date.now()}.json`;
     fs.writeFileSync(path.join(dir, filename), JSON.stringify(signal));
     debugLog(`SIGNAL: ${filename} (elapsed ${Math.round(elapsed/60000)}min)`);
+
+    // 直接发飞书通知
+    const notifyTarget = getNotifyTarget(task);
+    const label = task.label || task.command?.slice(0, 40) || task.childSessionKey;
+    sendFeishuNotification(
+      notifyTarget,
+      "⏰",
+      "任务停滞",
+      `${label}\n已运行 ${Math.round(elapsed / 60000)} 分钟无进展`
+    );
   } catch {}
 }
 
@@ -91,14 +161,6 @@ function isBackgroundExec(event) {
   } catch { return false; }
 }
 
-// 从 after_tool_call event 检测是否为后台 exec（params 中有 background=true）
-function isBackgroundExecAfter(event) {
-  try {
-    const params = event?.params ?? {};
-    return params?.background === true || params?.background === "true";
-  } catch { return false; }
-}
-
 module.exports = {
   register(api) {
     if (!api.on) return;
@@ -109,7 +171,7 @@ module.exports = {
     const signalDir = cfg.signalDir ?? "~/.openclaw/workspace/data/signals";
     const execTimeoutMs = cfg.execStaleTimeoutMs ?? timeoutMs;
 
-    debugLog("PLUGIN_LOADED: progress-monitor v1.1 (with exec support)");
+    debugLog(`PLUGIN_LOADED: progress-monitor v1.2 (with direct feishu notification, default user=${cfg?.userOpenId || "none"})`);
 
     // gateway_start: 恢复未完成任务
     api.on("gateway_start", (event, ctx) => {
@@ -140,7 +202,7 @@ module.exports = {
         };
         tasks.set(key, task);
         startTimer(key, timeoutMs, signalDir);
-        debugLog(`SUBAGENT_SPAWNED: ${key} label=${task.label}`);
+        debugLog(`SUBAGENT_SPAWNED: ${key} label=${task.label} requester=${task.requesterSessionKey}`);
         const trace = loadTrace();
         trace[key] = { ...task, timer: undefined };
         saveTrace(trace);
@@ -176,13 +238,11 @@ module.exports = {
     });
 
     // ========== Exec 长任务监控 ==========
-    // before_tool_call: 检测后台 exec 调用
     api.on("before_tool_call", (event, ctx) => {
       try {
         if (event?.toolName !== "exec") return;
         const command = extractExecCommand(event);
         if (!command || command.length < 10) return;
-        // 只监控后台 exec（前台 exec 是同步的，不存在停滞问题）
         if (!isBackgroundExec(event)) {
           debugLog(`EXEC_SKIP_FOREGROUND: ${command.slice(0, 50)}`);
           return;
@@ -203,7 +263,7 @@ module.exports = {
           command,
         };
         tasks.set(key, task);
-        debugLog(`EXEC_BEFORE: ${key} cmd=${command.slice(0, 50)}`);
+        debugLog(`EXEC_BEFORE: ${key} cmd=${command.slice(0, 50)} requester=${sessionKey}`);
         const trace = loadTrace();
         trace[key] = { ...task, timer: undefined, status: "pending" };
         saveTrace(trace);
@@ -215,7 +275,6 @@ module.exports = {
       try {
         if (event?.toolName !== "exec") return;
         const sessionKey = ctx?.sessionKey ?? "unknown";
-        // 找到对应的 exec task
         let foundKey = null;
         for (const [k, t] of tasks) {
           if (t.type === "exec" && t.sessionKey === sessionKey && t.status !== "completed") {
@@ -228,8 +287,6 @@ module.exports = {
           return;
         }
         const task = tasks.get(foundKey);
-
-        // after_tool_call 触发说明 exec 已经启动了，开始计时
         startTimer(foundKey, execTimeoutMs, signalDir);
         task.status = "running";
         debugLog(`EXEC_AFTER: ${foundKey} status=running, timer started (${execTimeoutMs}ms)`);
