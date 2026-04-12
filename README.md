@@ -129,16 +129,16 @@
 
 | OpenClaw 事件 | 触发时机 | 插件动作 |
 |---------------|---------|--------|
-| `subagent_spawned` | `sessions_spawn` 调用后 | 记录任务 + 启动 5min 计时器 |
+| `subagent_spawned` | `sessions_spawn` 调用后 | 记录任务 + 获取 requesterSessionKey + 启动 5min 计时器 |
 | `subagent_ended` | SubAgent 完成/失败 | 清理计时器 |
-| `before_tool_call` | 检测到后台 `exec` | 记录 exec 任务 |
+| `before_tool_call` | 检测到后台 `exec` | 记录 exec 任务 + 获取 sessionKey |
 | `after_tool_call` | 后台 exec 启动后 | 开始停滞计时 |
 | `agent_end` | 主 Agent 一轮对话结束 | 重置所有关联计时器（表明主 Agent 还活着） |
 | `gateway_start` | OpenClaw 网关启动 | 恢复未完成任务 | 
 
-停滞时：写 signal 文件 → 请求立即心跳 → AI 读取后处理。
+停滞时：写 signal 文件 → **直接发送飞书通知** → 请求立即心跳 → AI 读取后处理。
 
-> ⚠️ progress-monitor 只写 signal，不直接发飞书通知。飞书通知由 Watch Daemon 或 AI 在处理 signal 时发送。
+通知人从 `requesterSessionKey` 自动解析（飞书私聊/群），解析不出则用 `userOpenId` 配置兜底。
 
 ### 5. Heartbeat 集成
 
@@ -229,12 +229,12 @@ cp -r skills/trace-query/* $WORKSPACE/skills/trace-query/
 # Step 0: 查询相似历史任务
 python3 skills/trace-query/scripts/query_api.py similar --goal "实现用户认证" --k 3
 
-# Step 1: 初始化追踪
+# Step 1: 初始化追踪（--requester 传入 session key，自动解析通知人）
 TASK_ID="task-$(date +%Y%m%d-%H%M%S)-user-auth"
 python3 skills/task-coordinator/scripts/task_tracker.py init \
   "$TASK_ID" "实现用户认证模块" "claudecode" \
   --steps "设计模型,实现接口,编写测试" \
-  --notify-user "ou_xxxxxxxxxxxx"
+  --requester "agent:main:feishu:direct:ou_xxxxxxxxxxxx"
 
 # Step 2: spawn SubAgent（用 TASK_ID 作为 label）
 sessions_spawn({ task: "...", label: TASK_ID, ... })
@@ -243,6 +243,8 @@ sessions_spawn({ task: "...", label: TASK_ID, ... })
 python3 skills/task-coordinator/scripts/task_tracker.py complete \
   "$TASK_ID" --output "用户认证模块实现完成"
 ```
+
+> **注意**: 如果不传 `--requester`，通知人会降级到 DEFAULT_NOTIFY_USER 或 USER.md 中的 open_id。progress-monitor 插件会自动从 OpenClaw 事件获取 session key，无需手动传参。
 
 ### 查看任务状态
 
@@ -279,6 +281,7 @@ python3 skills/trace-query/scripts/query_api.py failures
 |------|--------|------|
 | `TASK_TRACE_DIR` | `~/.openclaw/workspace/data/task-traces` | 追踪数据目录 |
 | `SIGNAL_DIR` | `~/.openclaw/workspace/data/signals` | Signal 文件目录 |
+| `DEFAULT_NOTIFY_USER` | （空） | 通知兜底 open_id（优先级低于 requesterSessionKey 解析） |
 
 ### Watch Daemon 参数
 
@@ -290,16 +293,37 @@ python3 skills/trace-query/scripts/query_api.py failures
 | `--stale-threshold` | 300 | 停滞告警阈值（秒） |
 | `--timeout` | 600 | 超时标记阈值（秒） |
 
+### progress-monitor 插件参数
+
+通过 `openclaw.plugin.json` 的 `configSchema` 配置：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `staleTimeoutMs` | 300000 (5min) | SubAgent 停滞阈值（毫秒） |
+| `execStaleTimeoutMs` | 300000 (5min) | 后台 exec 停滞阈值（毫秒） |
+| `execMinDurationMs` | 60000 (1min) | exec 最短监控时长（毫秒） |
+| `userOpenId` | （空） | 飞书通知兜底 open_id |
+| `signalDir` | `~/.openclaw/workspace/data/signals` | Signal 文件目录 |
+
 ### 飞书通知
 
-Watch Daemon 检测到停滞/超时时，会自动发送飞书通知。通知人的确定顺序：
+Watch Daemon 和 progress-monitor 检测到停滞/超时时，会自动发送飞书通知。**两个组件共用相同的通知人解析优先级**：
 
-1. `task init --notify-user` 指定的 open_id
-2. `DEFAULT_NOTIFY_USER` 环境变量
-3. 从 `~/.openclaw/workspace/USER.md` 自动解析 `ou_xxx` 开头的 open_id
-4. 以上都没有则跳过通知（记录到 watch.log）
+```
+优先级（从高到低）:
+1. task init --notify-user "user:ou_xxx" 或 "chat:oc_xxx"  （显式指定）
+2. requesterSessionKey 自动解析
+   ├─ agent:main:feishu:direct:ou_xxx  → 通知 user:ou_xxx（飞书私聊用户）
+   ├─ agent:main:feishu:group:oc_xxx   → 通知 chat:oc_xxx（飞书群）
+   └─ agent:main:web:xxx               → 解析不出，降级
+3. 兜底默认值（三层 fallback）
+   ├─ DEFAULT_NOTIFY_USER 环境变量
+   ├─ USER.md 中自动解析 ou_xxx
+   └─ progress-monitor 插件的 userOpenId 配置
+4. 以上都没有 → 跳过通知（记录到 watch.log）
+```
 
-大多数情况下**不需要任何配置**，只要 USER.md 里包含你的 open_id 即可。
+> **大多数情况下零配置**：progress-monitor 插件自动从 `subagent_spawned` 事件获取 `requesterSessionKey`，直接解析出通知人。task-coordinator 的 `init --requester` 参数也会保存 session key。只有 web 会话等无法解析的场景才需要配置默认值。
 
 ## 开发指南
 
@@ -354,6 +378,7 @@ openclaw-task-monitor/
 1. **Watch Daemon 是独立进程**: 停滞检测和飞书通知不依赖 Heartbeat。Heartbeat 仅负责保活和 Signal 收集，即使关闭 Heartbeat，Watch Daemon 的飞书通知仍然正常工作
 2. **progress-monitor 需要 OpenClaw 重启**: 安装/更新插件后需要重启 OpenClaw gateway（`openclaw gateway restart`）才能生效
 3. **两层监控互补**: progress-monitor 自动兜底所有 spawn/exec，task-coordinator 提供细粒度手动追踪
+4. **通知人自动解析**: progress-monitor 从 OpenClaw 事件自动获取 session key；task-coordinator 通过 `--requester` 参数传入。飞书私聊/群会话自动解析，web 会话降级到默认值
 2. **Signal 清理**: 心跳会自动收集并清理 signal 文件，不需要手动清理
 3. **数据清理**: 定期运行 `cleanup` 命令清理过期记录（默认保留72小时）
 4. **PID 文件**: Watch Daemon 的 PID 文件在 `data/task-traces/watch.pid`，进程异常退出时可能残留，重启前确认无残留进程
