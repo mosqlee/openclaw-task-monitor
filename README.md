@@ -373,6 +373,74 @@ openclaw-task-monitor/
 - **Web Dashboard**: 基于 task-traces 数据构建可视化面板
 - **Prometheus 集成**: 暴露任务指标供监控系统采集
 
+## ClawTeam 集成
+
+> **Bridge 脚本**: `scripts/clawteam-bridge.sh` — 连接 ClawTeam 多 Agent 编排和 task-monitor 追踪系统。
+
+### 为什么需要
+
+ClawTeam 执行开发任务时，task-monitor 完全看不到 ClawTeam 的进度。Bridge 解决这个问题：
+
+```
+┌──────────────┐    bridge.sh     ┌──────────────────┐
+│  ClawTeam     │ ──────────────→ │  task-monitor    │
+│  (多Agent编排) │                 │  (追踪+通知)      │
+│              │                 │                  │
+│  GATE 完成    │ → gate 命令    │  checkpoint 记录   │
+│  Worker 消息  │ → notify 命令   │  signal 文件       │
+│  团队完成/失败 │ → complete/fail │  system event 唤醒  │
+└──────────────┘                 └──────────────────┘
+```
+
+### 快速开始
+
+```bash
+# 1. 安装（setup.sh 已自动包含）
+bash scripts/setup.sh
+
+# 2. 在 clawteam-run.sh 中集成
+BRIDGE="$HOME/.openclaw/workspace/scripts/clawteam-bridge.sh"
+
+# launch 前: 初始化追踪
+bash "$BRIDGE" init my-game "复刻黄金矿工"
+
+# 每个 GATE 完成时:
+bash "$BRIDGE" gate my-game 0 completed "产品诊断完成"
+
+# Worker 实时通知:
+bash "$BRIDGE" notify my-game coder "实现了用户认证模块"
+
+# 团队完成/失败:
+bash "$BRIDGE" complete my-game "全部GATE通过"
+bash "$BRIDGE" fail my-game "编译错误"
+
+# 查询状态:
+bash "$BRIDGE" status my-game
+```
+
+### 集成后的数据流
+
+```
+clawteam-run.sh 启动
+  │
+  ├─→ bridge init          → task_tracker.py init (7个GATE步骤)
+  │
+  ├─→ [ClawTeam Worker 执行 GATE 0..6]
+  │   │
+  │   ├─→ bridge gate N     → checkpoint + signal + system event
+  │   ├─→ bridge notify     → signal + system event (实时)
+  │   │
+  │   ▼
+  ├─→ bridge complete/fail  → result + signal + system event
+  │
+  ▼
+Watch Daemon 自动扫描 ct-* 任务 → 停滞/超时检测 + 飞书通知 ✅
+Heartbeat 收集 signal 文件 → AI 读取后处理 ✅
+trace-query 可查询历史轨迹 ✅
+```
+
+详细集成文档见 [docs/clawteam-integration.md](docs/clawteam-integration.md)。
+
 ## 注意事项
 
 1. **Watch Daemon 是独立进程**: 停滞检测和飞书通知不依赖 Heartbeat。Heartbeat 仅负责保活和 Signal 收集，即使关闭 Heartbeat，Watch Daemon 的飞书通知仍然正常工作
