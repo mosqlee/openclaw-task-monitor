@@ -206,6 +206,27 @@ module.exports = {
         const trace = loadTrace();
         trace[key] = { ...task, timer: undefined };
         saveTrace(trace);
+
+        // Auto-register with task-coordinator (task_tracker.py init)
+        try {
+          const trackerScript = path.join(
+            os.homedir(), ".openclaw/workspace/skills/task-coordinator/scripts/task_tracker.py"
+          );
+          const taskId = key.replace(/[^a-zA-Z0-9._-]/g, "_");
+          const goal = task.label || `Subagent: ${event.agentId}`;
+          const agent = event.agentId || "main";
+          const requester = task.requesterSessionKey || "";
+          const initCmd = [
+            "python3", trackerScript, "init", taskId, goal, agent,
+            "--requester", requester,
+          ];
+          const initResult = execSync(initCmd.map(c => `'${c}'`).join(" "), {
+            timeout: 5000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
+          });
+          debugLog(`TASK_TRACKER_INIT: ${taskId} result=${initResult.trim()}`);
+        } catch (e) {
+          debugLog(`TASK_TRACKER_INIT_FAIL: ${key} error=${e.message?.slice(0, 200)}`);
+        }
       } catch {}
     });
 
@@ -220,7 +241,7 @@ module.exports = {
       } catch {}
     });
 
-    // subagent_ended: 清理
+    // subagent_ended: 清理 + 通知 task-coordinator
     api.on("subagent_ended", (event, ctx) => {
       try {
         const key = event.targetSessionKey;
@@ -233,6 +254,26 @@ module.exports = {
           trace[key].endedAt = event.endedAt ?? Date.now();
           trace[key].outcome = event.outcome;
           saveTrace(trace);
+        }
+
+        // Notify task-coordinator (complete/fail)
+        try {
+          const trackerScript = path.join(
+            os.homedir(), ".openclaw/workspace/skills/task-coordinator/scripts/task_tracker.py"
+          );
+          const taskId = key.replace(/[^a-zA-Z0-9._-]/g, "_");
+          const duration = task ? Date.now() - task.startTime : 0;
+          const outcome = event.outcome || "completed";
+          const isFail = outcome.includes("fail") || outcome.includes("error") || outcome.includes("timeout");
+          const cmd = isFail
+            ? `python3 '${trackerScript}' fail '${taskId}' 'Subagent ended: ${outcome}' --duration ${duration}`
+            : `python3 '${trackerScript}' complete '${taskId}' --output 'Subagent ended: ${outcome}' --duration ${duration}`;
+          const result = execSync(cmd, {
+            timeout: 5000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
+          });
+          debugLog(`TASK_TRACKER_${isFail ? "FAIL" : "COMPLETE"}: ${taskId} duration=${duration}ms result=${result.trim()}`);
+        } catch (e) {
+          debugLog(`TASK_TRACKER_END_FAIL: ${key} error=${e.message?.slice(0, 200)}`);
         }
       } catch {}
     });
