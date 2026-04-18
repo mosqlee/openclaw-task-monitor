@@ -35,3 +35,30 @@
 □ Step 3: 完成后 complete/fail/timeout
   python3 ~/.openclaw/workspace/skills/task-coordinator/scripts/task_tracker.py complete "$TASK_ID" --output "结果"
 ```
+
+## ClawTeam 任务强制 Checklist
+
+> ⚠️ **ClawTeam 任务必须走 bridge 打通 task-monitor，否则 Watch Daemon 扫不到！**
+
+```
+□ Step 0: bridge init — launch 前初始化团队追踪
+  bash ~/.openclaw/workspace/scripts/clawteam-bridge.sh init <team-name> '<项目目标>'
+  # → 自动创建 ct-{team}-init 任务，含 GATE0~GATE6 共7个步骤
+
+□ Step 1: 每个 GATE 完成时 → bridge gate
+  bash ~/.openclaw/workspace/scripts/clawteam-bridge.sh gate <team-name> <0-6> completed '<简述>'
+  # → checkpoint 记录 + signal 文件 + system event 唤醒主 session
+
+□ Step 2: Worker 实时通知 → bridge notify（可选但推荐）
+  bash ~/.openclaw/workspace/scripts/clawteam-bridge.sh notify <team-name> <agent名> '<内容>'
+  # → signal 文件 + system event（主 Agent 阻塞期间也能收到）
+
+□ Step 3: 团队完成/失败 → bridge complete/fail
+  bash ~/.openclaw/workspace/scripts/clawteam-bridge.sh complete <team-name> '<输出摘要>'
+  # 或
+  bash ~/.openclaw/workspace/scripts/clawteam-bridge.sh fail <team-name> '<原因>'
+
+□ Step 4: 验证（可选）
+  bash ~/.openclaw/workspace/scripts/clawteam-bridge.sh status <team-name>
+  ls ~/.openclaw/workspace/data/signals/*<team-name>* 2>/dev/null
+```
