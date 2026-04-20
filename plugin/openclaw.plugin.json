@@ -35,17 +35,17 @@
       "claudeProgressDir": {
         "type": "string",
         "default": "~/.openclaw/workspace/data/claude-progress",
-        "description": "Claude Code progress files directory"
+        "description": "Claude Code hooks progress directory (optional, auto-skip if not exists)"
       },
       "claudeStaleTimeoutMs": {
         "type": "number",
-        "default": 300000,
-        "description": "Claude ACP session stale timeout in milliseconds (default: 5 min)"
+        "default": 120000,
+        "description": "Claude stale threshold in ms (default: 2 min)"
       },
       "claudeNotifyIntervalMs": {
         "type": "number",
         "default": 60000,
-        "description": "Minimum interval between Claude progress notifications (default: 1 min)"
+        "description": "Min interval between Claude progress notifications (default: 1 min)"
       }
     }
   }
