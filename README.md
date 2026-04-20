@@ -136,6 +136,14 @@
 | `agent_end` | 主 Agent 一轮对话结束 | 重置所有关联计时器（表明主 Agent 还活着） |
 | `gateway_start` | OpenClaw 网关启动 | 恢复未完成任务 | 
 
+**Claude ACP 进度监控**（额外能力）：
+
+| 机制 | 说明 |
+|------|------|
+| `fs.watch` | 监听 `claude-progress/` 目录的 `_latest.json` 文件变化 |
+| ACP session 关联 | 通过 `subagent_spawned` 事件（agentId 含 claude）关联 Claude 进度 |
+| 停滞检测 | 定时检查 ACP session 是否有新进度 | 
+
 停滞时：写 signal 文件 → **直接发送飞书通知** → 请求立即心跳 → AI 读取后处理。
 
 通知人从 `requesterSessionKey` 自动解析（飞书私聊/群），解析不出则用 `userOpenId` 配置兜底。
@@ -340,9 +348,11 @@ python3 -m pytest test_task_tracker.py -v
 openclaw-task-monitor/
 ├── README.md                          # 本文件
 ├── LICENSE                            # MIT 许可证
+├── hooks/
+│   └── claude-progress.sh             # Claude Code hooks 脚本
 ├── plugin/
 │   ├── openclaw.plugin.json           # progress-monitor 插件元数据
-│   └── index.js                       # progress-monitor 插件逻辑
+│   └── index.js                       # progress-monitor 插件逻辑（含 Claude 进度监控）
 ├── skills/
 │   ├── task-coordinator/
 │   │   ├── SKILL.md                   # Skill 元数据和使用说明
@@ -440,6 +450,159 @@ trace-query 可查询历史轨迹 ✅
 ```
 
 详细集成文档见 [docs/clawteam-integration.md](docs/clawteam-integration.md)。
+
+## Claude Code 进度监控（ACP Hooks）
+
+当通过 OpenClaw 的 ACP（Agent Client Protocol）调用 Claude Code 时，Claude 运行在一个独立的进程中，progress-monitor 插件无法直接获取其内部进度。本模块通过 **Claude Code Hooks + 文件中转** 解决这个“黑盒执行”问题。
+
+### 架构
+
+```
+Claude Code (ACP 进程)
+  │
+  │ hooks-config.json 中的 hooks 配置触发
+  ▼
+claude-progress.sh
+  │ 写入 JSONL + _latest.json
+  ▼
+~/.openclaw/workspace/data/claude-progress/
+  │ fs.watch 实时监听
+  ▼
+progress-monitor 插件
+  │ 读取进度 → 飞书通知
+  ▼
+用户收到实时进度更新 ✅
+```
+
+### 自动安装
+
+运行 `bash scripts/setup.sh`，脚本会自动：
+- ✅ 复制 `claude-progress.sh` 到 `~/.claude/hooks/`
+- ✅ 在 `~/.claude/settings.json` 中注入 hooks 配置
+- ✅ 创建 `data/claude-progress/` 目录
+
+### 手动安装
+
+**Step 1: 复制 Hook 脚本**
+
+```bash
+mkdir -p ~/.claude/hooks
+cp hooks/claude-progress.sh ~/.claude/hooks/
+chmod +x ~/.claude/hooks/claude-progress.sh
+```
+
+**Step 2: 配置 Claude Code Hooks**
+
+编辑 `~/.claude/settings.json`，添加以下 `hooks` 配置：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|Read",
+        "hooks": [{
+          "type": "command",
+          "command": "$HOME/.claude/hooks/claude-progress.sh pre"
+        }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [{
+          "type": "command",
+          "command": "$HOME/.claude/hooks/claude-progress.sh post"
+        }]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [{
+          "type": "command",
+          "command": "$HOME/.claude/hooks/claude-progress.sh fail"
+        }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "$HOME/.claude/hooks/claude-progress.sh session_end"
+        }]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "$HOME/.claude/hooks/claude-progress.sh session_fail"
+        }]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "$HOME/.claude/hooks/claude-progress.sh subagent_start"
+        }]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [{
+          "type": "command",
+          "command": "$HOME/.claude/hooks/claude-progress.sh subagent_stop"
+        }]
+      }
+    ]
+  }
+}
+```
+
+> ⚠️ **重要**: `command` 字段中 `$HOME` 必须用双引号或不加引号，确保 shell 能展开环境变量。不要用 `'$HOME/...'` 单引号格式，否则路径无法解析。
+
+**Step 3: 重启 OpenClaw**
+
+```bash
+openclaw gateway restart
+```
+
+### 监控的事件
+
+| Hook 事件 | 触发时机 | 写入内容 |
+|-----------|---------|----------|
+| `PreToolUse` | Claude 调用工具前 | 工具名 + 输入（仅 Bash/Edit/Write/Read） |
+| `PostToolUse` | Claude 工具返回后 | 工具名 + 输出 |
+| `PostToolUseFailure` | 工具调用失败 | 工具名 + 错误信息 |
+| `Stop` | Claude 会话正常结束 | session_end 标记 |
+| `StopFailure` | Claude 会话异常结束 | session_fail 标记 |
+| `SubagentStart` | Claude 子代理启动 | agent_type |
+| `SubagentStop` | Claude 子代理结束 | agent_type + outcome |
+
+### 插件配置
+
+在 `openclaw.plugin.json` 中可调整以下参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `claudeProgressDir` | `~/.openclaw/workspace/data/claude-progress` | Claude 进度文件目录 |
+| `claudeStaleTimeoutMs` | 300000 (5min) | Claude ACP 会话停滞超时 |
+| `claudeNotifyIntervalMs` | 60000 (1min) | Claude 进度通知最小间隔 |
+
+### 健壮性设计
+
+- **无 Claude 时零影响**: 如果 `claude-progress/` 目录不存在（即未安装 Claude Code），插件自动跳过 fs.watch，不影响原有功能
+- **JSONL 完整日志**: 所有事件追加写入 `{session_id}.jsonl`，可回溯完整执行历史
+- **latest 快速读取**: `{session_id}_latest.json` 保留最新状态，供 fs.watch 高效检测
+- **jq 依赖检查**: hook 脚本会检查 `jq` 是否可用，不可用时静默退出
+
+### 注意事项
+
+1. **ACP subagent 事件限制**: OpenClaw 当前版本（2026.4.x）的 ACP spawn 路径不触发 `subagent_spawned`/`subagent_ended` 插件事件（普通 subagent 正常触发）。Claude 进度监控通过 hooks 文件中转绕过了这个限制
+2. **hook command 格式**: Claude Code 通过 `shell: true` 执行 hook command，`$HOME` 在双引号 JSON 字符串中由 shell 展开。不要用单引号包裹路径
+3. **Claude Code 版本**: 需要 Claude Code 2.1+ 支持 hooks 功能
 
 ## 注意事项
 

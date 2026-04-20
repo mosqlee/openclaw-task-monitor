@@ -31,6 +31,21 @@
         "type": "number",
         "default": 60000,
         "description": "Minimum exec duration before monitoring kicks in (default: 1 min)"
+      },
+      "claudeProgressDir": {
+        "type": "string",
+        "default": "~/.openclaw/workspace/data/claude-progress",
+        "description": "Claude Code progress files directory"
+      },
+      "claudeStaleTimeoutMs": {
+        "type": "number",
+        "default": 300000,
+        "description": "Claude ACP session stale timeout in milliseconds (default: 5 min)"
+      },
+      "claudeNotifyIntervalMs": {
+        "type": "number",
+        "default": 60000,
+        "description": "Minimum interval between Claude progress notifications (default: 1 min)"
       }
     }
   }

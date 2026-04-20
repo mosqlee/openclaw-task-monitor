@@ -278,6 +278,82 @@ module.exports = {
       } catch {}
     });
 
+    // ========== Claude Code 进度监控（ACP Hooks 文件监听） ==========
+    const claudeProgressDir = expandDir(cfg.claudeProgressDir ?? "~/.openclaw/workspace/data/claude-progress");
+    const claudeStaleTimeoutMs = cfg.claudeStaleTimeoutMs ?? 300000;
+    const claudeNotifyIntervalMs = cfg.claudeNotifyIntervalMs ?? 60000;
+    const claudeSessions = new Map(); // childSessionKey -> { lastNotify, lastTool, startTime }
+
+    try {
+      if (fs.existsSync(claudeProgressDir)) {
+        fs.watch(claudeProgressDir, (eventType, filename) => {
+          if (!filename || !filename.endsWith("_latest.json")) return;
+          try {
+            const filePath = path.join(claudeProgressDir, filename);
+            const content = fs.readFileSync(filePath, "utf-8");
+            if (!content.trim()) return;
+            const data = JSON.parse(content);
+            const sessionId = filename.replace("_latest.json", "");
+            debugLog(`CLAUDE_PROGRESS: ${sessionId} ${data.tool ? data.tool + ": " : ""}${(data.input || "").slice(0, 80)}`);
+
+            // Check if this session is tracked as a Claude ACP session
+            let tracked = false;
+            for (const [key, info] of claudeSessions) {
+              if (key.includes(sessionId.slice(0, 8))) {
+                info.lastTool = `${data.event}: ${data.tool || ""} ${data.input || ""}`.trim();
+                const now = Date.now();
+                if (now - info.lastNotify > claudeNotifyIntervalMs) {
+                  info.lastNotify = now;
+                  const label = info.label || sessionId;
+                  const notifyTarget = getNotifyTarget({ requesterSessionKey: info.requesterSessionKey });
+                  sendFeishuNotification(notifyTarget, "\uD83D\uDC9D", "Claude 进度", `${label}\n${info.lastTool}`);
+                }
+                tracked = true;
+                break;
+              }
+            }
+          } catch (e) {
+            debugLog(`CLAUDE_READ_FAIL: ${e.message?.slice(0, 100)}`);
+          }
+        });
+        debugLog(`CLAUDE_FS_WATCH_ENABLED: ${claudeProgressDir}`);
+      } else {
+        debugLog(`CLAUDE_FS_WATCH_SKIP: ${claudeProgressDir} not found (Claude not installed or hooks not configured)`);
+      }
+    } catch (e) {
+      debugLog(`CLAUDE_SETUP_FAIL: ${e.message?.slice(0, 100)}`);
+    }
+
+    // Check Claude ACP sessions periodically for staleness
+    function checkClaudeProgress() {
+      const now = Date.now();
+      for (const [key, info] of claudeSessions) {
+        if (now - info.lastNotify > claudeStaleTimeoutMs && info.lastTool) {
+          info.lastNotify = now;
+          const label = info.label || key;
+          const elapsed = Math.round((now - info.startTime) / 60000);
+          const notifyTarget = getNotifyTarget({ requesterSessionKey: info.requesterSessionKey });
+          sendFeishuNotification(notifyTarget, "\u26A0\uFE0F", "Claude 停滞", `${label}\n${elapsed} 分钟无新进展\n最后: ${info.lastTool}`);
+        }
+      }
+    }
+    const claudeCheckInterval = setInterval(checkClaudeProgress, 60000).unref();
+
+    // ACP session 关联 Claude 进度
+    api.on("subagent_spawned", (event, ctx) => {
+      if (event.agentId !== "claude" && !(event.agentId && event.agentId.includes("claude"))) return;
+      claudeSessions.set(event.childSessionKey, { lastNotify: 0, lastTool: "", startTime: Date.now(), label: event.label, requesterSessionKey: ctx?.requesterSessionKey });
+      debugLog(`CLAUDE_ACP_START: ${event.childSessionKey}`);
+      checkClaudeProgress();
+    });
+
+    api.on("subagent_ended", (event, ctx) => {
+      const key = event.targetSessionKey;
+      if (!claudeSessions.has(key)) return;
+      claudeSessions.delete(key);
+      debugLog(`CLAUDE_ACP_END: ${key}`);
+    });
+
     // ========== Exec 长任务监控 ==========
     api.on("before_tool_call", (event, ctx) => {
       try {

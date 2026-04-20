@@ -37,6 +37,7 @@ mkdir -p "$WORKSPACE/skills/trace-query/scripts"
 mkdir -p "$WORKSPACE/data/task-traces"
 mkdir -p "$WORKSPACE/data/signals"
 mkdir -p "$OPENCLAW_DIR/extensions/progress-monitor"
+mkdir -p "$WORKSPACE/data/claude-progress"
 echo "✅ 目录结构创建完成"
 
 # 安装 progress-monitor 插件
@@ -67,6 +68,54 @@ else
     echo "⚠️  openclaw.json 不存在，请手动配置 plugins.allow 包含 progress-monitor"
 fi
 echo "✅ progress-monitor 插件安装完成"
+
+# 安装 Claude Code hooks（可选）
+echo ""
+echo "🪝 配置 Claude Code Hooks..."
+CLAUDE_HOOKS_DIR="$HOME/.claude/hooks"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+
+if [ -f "$CLAUDE_SETTINGS" ]; then
+    # 复制 hook 脚本
+    mkdir -p "$CLAUDE_HOOKS_DIR"
+    cp "$PROJECT_DIR/hooks/claude-progress.sh" "$CLAUDE_HOOKS_DIR/"
+    chmod +x "$CLAUDE_HOOKS_DIR/claude-progress.sh"
+
+    # 检查是否已配置 hooks
+    if grep -q "claude-progress.sh" "$CLAUDE_SETTINGS" 2>/dev/null; then
+        echo "⚠️  Claude settings.json 已包含 claude-progress.sh hooks，跳过配置"
+    else
+        # 使用 node 安全合并 hooks 配置
+        node -e "
+const fs = require('fs');
+const cfg = JSON.parse(fs.readFileSync('$CLAUDE_SETTINGS', 'utf8'));
+cfg.hooks = cfg.hooks || {};
+const hookCmd = process.env.HOME + '/.claude/hooks/claude-progress.sh';
+
+const addHook = (event, matcher, arg) => {
+  if (!cfg.hooks[event]) cfg.hooks[event] = [];
+  cfg.hooks[event].push({
+    hooks: [{ type: 'command', command: hookCmd + ' ' + arg }],
+    ...(matcher ? { matcher } : {})
+  });
+};
+
+addHook('PreToolUse', 'Bash|Edit|Write|Read', 'pre');
+addHook('PostToolUse', '*', 'post');
+addHook('PostToolUseFailure', '*', 'fail');
+addHook('Stop', null, 'session_end');
+addHook('StopFailure', null, 'session_fail');
+addHook('SubagentStart', null, 'subagent_start');
+addHook('SubagentStop', null, 'subagent_stop');
+
+fs.writeFileSync('$CLAUDE_SETTINGS', JSON.stringify(cfg, null, 2));
+console.log('Claude hooks configured in settings.json');
+" 2>/dev/null && echo "✅ Claude Code hooks 配置完成" || echo "⚠️  无法自动配置 Claude hooks，请手动参考 README.md"
+    fi
+else
+    echo "⚠️  Claude settings.json 不存在，跳过 hooks 配置"
+    echo "   如需使用 Claude Code 进度监控，请参考 README.md 手动配置"
+fi
 
 # 复制文件
 echo ""
