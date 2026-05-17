@@ -93,6 +93,69 @@ python3 skills/task-coordinator/scripts/task_tracker.py timeout "$TASK_ID" \
 
 ---
 
+## 主会话执行计划（Execution Plan）
+
+> **适用场景**：主会话中执行 ≥2 步的任务（不涉及 spawn subagent 时）。
+> **目的**：防止多步骤任务做到一半停住。
+
+### 什么时候生成？
+
+当收到 ≥2 步的多步骤指令时，**必须**先生成 execution plan 文件，再开始执行。
+
+### 操作步骤
+
+#### 1. 生成 Plan 文件
+
+用 `write` 工具创建：
+
+```
+path: data/task-traces/plan-{sanitized_sessionKey}.md
+```
+
+其中 sanitized_sessionKey = sessionKey 中 `:/\\` 替换为 `_`，取前 64 字符。
+
+**文件格式：**
+```markdown
+# Execution Plan
+<!-- version: 1 -->
+**Task:** 一句话描述任务目标
+**Created:** YYYY-MM-DD HH:MM
+**Status:** IN_PROGRESS
+
+## Steps
+- [ ] 1. 步骤描述（要具体、可执行）
+- [ ] 2. 步骤描述
+- [ ] 3. 步骤描述
+
+## Context
+（跨步骤需要传递的参数：open_id、doc_id、URL 等）
+```
+
+#### 2. 逐步执行并更新状态
+
+每完成一步，**立即**用 `edit` 工具更新：`- [ ]` → `- [x]`
+
+#### 3. 全部完成
+
+将 Status 改为 `DONE`。插件会自动检测并删除文件。
+
+### 插件自动行为（无需手动操作）
+
+| Hook | 行为 |
+|------|------|
+| `before_prompt_build` | 每次 AI 调用前，自动注入未完成的 plan 到上下文 |
+| `agent_end` | 会话结束时 plan 仍有未完成步骤 → 发飞书通知兜底 |
+| `gateway_start` | 启动时清理超过 24h 的残留 plan 文件 |
+
+### 注意事项
+
+- 步骤描述要**具体、可执行**，不要写模糊的描述
+- Context 区域存放跨步骤需要传递的参数
+- 简单的单步任务（<2步）不需要生成 plan
+- 如果任务被打断，下次继续时 plan 会自动注入上下文
+
+---
+
 ## 追踪文件位置
 
 ```

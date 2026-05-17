@@ -1,5 +1,5 @@
-// progress-monitor v1.3 — 监控 subagent + exec + Claude Code 进度，停滞时通知
-// v1.3: 异步通知、通知上限、自动清理结束任务、更宽松的频率
+// progress-monitor v1.4 — 监控 subagent + exec + Claude Code 进度 + Execution Plan 注入
+// v1.4: 新增 execution plan 上下文注入（before_prompt_build）、agent_end 兜底、残留清理
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -181,6 +181,63 @@ function isBackgroundExec(event) {
   } catch { return false; }
 }
 
+// ========== Execution Plan 工具函数 ==========
+const PLAN_DIR = path.join(os.homedir(), ".openclaw/workspace/data/task-traces");
+const PLAN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const planCache = new Map(); // filePath -> { content, mtimeMs }
+
+function sanitizeSessionKey(sessionKey) {
+  return String(sessionKey || "unknown").replace(/[:/\\]/g, "_").slice(0, 64);
+}
+
+function planPathForSession(sessionKey) {
+  return path.join(PLAN_DIR, `plan-${sanitizeSessionKey(sessionKey)}.md`);
+}
+
+// 精确解析 Status 字段
+function parsePlanStatus(content) {
+  const match = content.match(/\*\*Status:\*\*\s*(\S+)/);
+  return match ? match[1] : null;
+}
+
+// 异步读取当前 session 的 plan（带 mtime 缓存）
+async function readPlan(sessionKey) {
+  const filePath = planPathForSession(sessionKey);
+  try {
+    const stats = await fs.promises.stat(filePath);
+    const cached = planCache.get(filePath);
+    if (cached && cached.mtimeMs === stats.mtimeMs) {
+      return { content: cached.content, filePath };
+    }
+    const content = await fs.promises.readFile(filePath, "utf-8");
+    planCache.set(filePath, { content, mtimeMs: stats.mtimeMs });
+    return { content, filePath };
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    debugLog(`PLAN_READ_ERROR: ${err.message}`);
+    return null;
+  }
+}
+
+// 清理过期 plan 文件（>24h）
+async function cleanupExpiredPlans() {
+  try {
+    const files = await fs.promises.readdir(PLAN_DIR).catch(() => []);
+    for (const file of files) {
+      if (!/^plan-.+\.md$/.test(file) && file !== "execution-plan.md") continue;
+      const filePath = path.join(PLAN_DIR, file);
+      const stats = await fs.promises.stat(filePath).catch(() => null);
+      if (stats && Date.now() - stats.mtimeMs > PLAN_MAX_AGE_MS) {
+        await fs.promises.unlink(filePath);
+        planCache.delete(filePath);
+        debugLog(`PLAN_EXPIRED_CLEANUP: ${file}`);
+      }
+    }
+  } catch (e) {
+    debugLog(`PLAN_CLEANUP_ERROR: ${e.message?.slice(0, 100)}`);
+  }
+}
+
 module.exports = {
   register(api) {
     if (!api.on) return;
@@ -191,9 +248,9 @@ module.exports = {
     const signalDir = cfg.signalDir ?? "~/.openclaw/workspace/data/signals";
     const execTimeoutMs = cfg.execStaleTimeoutMs ?? timeoutMs;
 
-    debugLog(`PLUGIN_LOADED: progress-monitor v1.3 (async notify, max_count=${cfg.maxStaleNotifyCount || 10}, default user=${cfg?.userOpenId || "none"})`);
+    debugLog(`PLUGIN_LOADED: progress-monitor v1.4 (async notify, max_count=${cfg.maxStaleNotifyCount || 10}, default user=${cfg?.userOpenId || "none"})`);
 
-    // gateway_start: 恢复未完成任务（带过期清理）
+    // gateway_start: 恢复未完成任务（带过期清理）+ 清理过期 plan 文件
     api.on("gateway_start", (event, ctx) => {
       debugLog("GATEWAY_START");
       try {
@@ -217,6 +274,9 @@ module.exports = {
         if (cleaned > 0) saveTrace(trace);
         debugLog(`GATEWAY_RESTORED: ${tasks.size} tasks, expired ${cleaned}`);
       } catch {}
+
+      // 清理超过 24h 的残留 plan 文件
+      cleanupExpiredPlans();
     });
 
     // subagent_spawned
@@ -261,7 +321,7 @@ module.exports = {
       } catch {}
     });
 
-    // agent_end: 重置计时器
+    // agent_end: 重置计时器 + 检查未完成的 execution plan
     api.on("agent_end", (event, ctx) => {
       try {
         for (const [key, task] of tasks) {
@@ -270,6 +330,27 @@ module.exports = {
           }
         }
       } catch {}
+
+      // Execution Plan 兜底检查
+      const _sk = ctx?.sessionKey ?? "unknown";
+      readPlan(_sk).then(plan => {
+        if (!plan) return;
+        const { content } = plan;
+        const status = parsePlanStatus(content);
+        if (status && status !== "DONE") {
+          const pending = (content.match(/^- \[ \]/gm) || []).length;
+          const done = (content.match(/^- \[x\]/gm) || []).length;
+          debugLog(`PLAN_INCOMPLETE: done=${done} pending=${pending} session=${_sk}`);
+          const notifyTarget = getNotifyTarget({ requesterSessionKey: _sk });
+          if (notifyTarget) {
+            sendFeishuNotification(
+              notifyTarget, "⚠️", "任务未完成",
+              `执行计划未完成：已完成 ${done} 步，剩余 ${pending} 步`,
+              `plan-incomplete:${_sk}`
+            );
+          }
+        }
+      }).catch(() => {}); // ENOENT 忽略
     });
 
     // subagent_ended: 清理 + 通知 task-coordinator
@@ -438,6 +519,28 @@ module.exports = {
     } catch (e) {
       debugLog(`CLAUDE_FS_WATCH_FAIL: ${e.message?.slice(0, 100)}`);
     }
+
+    // ========== Execution Plan 上下文注入 ==========
+    api.on("before_prompt_build", async (event, ctx) => {
+      const plan = await readPlan(ctx?.sessionKey);
+      if (!plan) return;
+
+      const { content, filePath } = plan;
+      const status = parsePlanStatus(content);
+      if (status === "DONE") {
+        try {
+          await fs.promises.unlink(filePath);
+          planCache.delete(filePath);
+          debugLog(`PLAN_CLEANED_DONE: ${path.basename(filePath)}`);
+        } catch {}
+        return;
+      }
+
+      debugLog(`PLAN_INJECTED: ${path.basename(filePath)}`);
+      return {
+        appendContext: `\n## ⚠️ 当前执行计划（必须按顺序完成所有步骤）\n**Plan file:** ${path.basename(filePath)}\n${content}\n**规则：完成一步后立即用 edit 工具更新 [ ] → [x]，全部完成后将 Status 改为 DONE。**\n`
+      };
+    });
 
     // ========== Exec 长任务监控 ==========
     api.on("before_tool_call", (event, ctx) => {

@@ -3,6 +3,12 @@
   "name": "Progress Monitor",
   "description": "Monitor subagent progress and notify on stale tasks",
   "version": "1.0.0",
+  "contracts": {
+    "hooks": ["subagent_spawned", "subagent_ended", "agent_end", "before_prompt_build", "before_tool_call", "after_tool_call", "gateway_start"]
+  },
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -32,6 +38,11 @@
         "default": 60000,
         "description": "Minimum exec duration before monitoring kicks in (default: 1 min)"
       },
+      "maxStaleNotifyCount": {
+        "type": "number",
+        "default": 10,
+        "description": "Maximum stale notifications before a tracked task is auto-cleaned"
+      },
       "claudeProgressDir": {
         "type": "string",
         "default": "~/.openclaw/workspace/data/claude-progress",
@@ -46,6 +57,11 @@
         "type": "number",
         "default": 60000,
         "description": "Min interval between Claude progress notifications (default: 1 min)"
+      },
+      "claudeMaxNotifyCount": {
+        "type": "number",
+        "default": 10,
+        "description": "Maximum Claude progress notifications before auto-cleanup"
       }
     }
   }
