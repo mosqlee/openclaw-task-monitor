@@ -1,14 +1,19 @@
-// progress-monitor — 监控 subagent + exec 长任务进度，停滞时通知用户
+// progress-monitor v1.3 — 监控 subagent + exec + Claude Code 进度，停滞时通知
+// v1.3: 异步通知、通知上限、自动清理结束任务、更宽松的频率
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const { execSync } = require("child_process");
+const { exec, execSync } = require("child_process");
 
 const TRACE_FILE = path.join(os.homedir(), ".openclaw/workspace/data/task-traces/plugin-tracked.json");
 const DEBUG_FILE = path.join(os.homedir(), ".openclaw/workspace/data/task-traces/plugin-debug.log");
 
 const tasks = new Map();
 let runtime, cfg;
+
+// 通知去重：防止并发重复发送
+const notifyingSet = new Set();
+const NOTIFY_DEDUP_TTL = 10000; // 10秒内同key不重复发送
 
 function expandDir(dir) {
   return dir.startsWith("~") ? dir.replace("~", os.homedir()) : dir;
@@ -32,63 +37,50 @@ function debugLog(msg) {
   } catch {}
 }
 
-/**
- * 从 requesterSessionKey 解析通知目标
- * 格式: agent:{agent_id}:{channel}:{type}:{target}
- *   agent:main:feishu:direct:ou_xxx  → user:ou_xxx
- *   agent:main:feishu:group:oc_xxx   → chat:oc_xxx
- *   agent:main:web:xxx               → "" (无法解析)
- */
 function resolveNotifyTarget(requesterSessionKey) {
   if (!requesterSessionKey) return "";
   const parts = requesterSessionKey.split(":");
   try {
     if (parts.length >= 5 && parts[2] === "feishu") {
-      const targetType = parts[3]; // direct / group
-      const targetId = parts[4];   // ou_xxx / oc_xxx
-      if (targetType === "direct" && targetId.startsWith("ou_")) {
-        return `user:${targetId}`;
-      }
-      if (targetType === "group" && targetId.startsWith("oc_")) {
-        return `chat:${targetId}`;
-      }
+      const targetType = parts[3];
+      const targetId = parts[4];
+      if (targetType === "direct" && targetId.startsWith("ou_")) return `user:${targetId}`;
+      if (targetType === "group" && targetId.startsWith("oc_")) return `chat:${targetId}`;
     }
   } catch {}
   return "";
 }
 
-/**
- * 获取通知目标（优先级: requesterSessionKey 解析 > userOpenId 配置）
- */
 function getNotifyTarget(task) {
-  // 1. 从 requesterSessionKey 解析
   const fromRequester = resolveNotifyTarget(task.requesterSessionKey);
-  if (fromRequester) {
-    debugLog(`NOTIFY_RESOLVED: ${task.childSessionKey} from requester -> ${fromRequester}`);
-    return fromRequester;
-  }
-  // 2. 使用插件配置的默认 userOpenId
+  if (fromRequester) return fromRequester;
   const defaultUser = cfg?.userOpenId || "";
-  if (defaultUser) {
-    debugLog(`NOTIFY_FALLBACK: ${task.childSessionKey} using userOpenId=${defaultUser}`);
-    return `user:${defaultUser}`;
-  }
-  debugLog(`NOTIFY_NONE: ${task.childSessionKey} no target resolved`);
+  if (defaultUser) return `user:${defaultUser}`;
   return "";
 }
 
-function sendFeishuNotification(target, emoji, title, message) {
+// 异步发送飞书通知（不阻塞主线程）
+function sendFeishuNotification(target, emoji, title, message, dedupKey) {
   if (!target) return;
-  try {
-    const fullMsg = `${emoji} ${title}: ${message}`;
-    const result = execSync(
-      `openclaw message send --channel feishu --target "${target}" --message '${fullMsg.replace(/'/g, "'\"'\"'")}'`,
-      { timeout: 10000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
-    );
-    debugLog(`FEISHU_SENT: to=${target} exit=0 stdout=${result.trim().slice(0, 200)}`);
-  } catch (e) {
-    debugLog(`FEISHU_FAILED: to=${target} error=${e.message?.slice(0, 200)}`);
+  // 去重检查
+  if (dedupKey && notifyingSet.has(dedupKey)) return;
+  if (dedupKey) {
+    notifyingSet.add(dedupKey);
+    setTimeout(() => notifyingSet.delete(dedupKey), NOTIFY_DEDUP_TTL);
   }
+  const fullMsg = `${emoji} ${title}: ${message}`;
+  const escaped = fullMsg.replace(/'/g, "'\"'\"'");
+  exec(
+    `openclaw message send --channel feishu --target "${target}" --message '${escaped}'`,
+    { timeout: 10000, encoding: "utf-8" },
+    (err, stdout, stderr) => {
+      if (err) {
+        debugLog(`FEISHU_FAILED: to=${target} error=${err.message?.slice(0, 200)}`);
+      } else {
+        debugLog(`FEISHU_SENT: to=${target} stdout=${(stdout || "").trim().slice(0, 200)}`);
+      }
+    }
+  );
 }
 
 function staleNotify(task, elapsed, signalDir) {
@@ -110,16 +102,14 @@ function staleNotify(task, elapsed, signalDir) {
       ? `exec-stale-${task.sessionKey}-${Date.now()}.json`
       : `stale-${task.childSessionKey}-${Date.now()}.json`;
     fs.writeFileSync(path.join(dir, filename), JSON.stringify(signal));
-    debugLog(`SIGNAL: ${filename} (elapsed ${Math.round(elapsed/60000)}min)`);
+    debugLog(`SIGNAL: ${filename} (elapsed ${Math.round(elapsed / 60000)}min)`);
 
-    // 直接发飞书通知
     const notifyTarget = getNotifyTarget(task);
     const label = task.label || task.command?.slice(0, 40) || task.childSessionKey;
     sendFeishuNotification(
-      notifyTarget,
-      "⏰",
-      "任务停滞",
-      `${label}\n已运行 ${Math.round(elapsed / 60000)} 分钟无进展`
+      notifyTarget, "⏰", "任务停滞",
+      `${label}\n已运行 ${Math.round(elapsed / 60000)} 分钟无进展`,
+      `stale:${task.childSessionKey}`
     );
   } catch {}
 }
@@ -130,7 +120,23 @@ function startTimer(key, timeoutMs, signalDir) {
   debugLog(`TIMER_START: ${key} timeout=${timeoutMs}ms`);
   task.timer = setTimeout(() => {
     const elapsed = Date.now() - task.startTime;
-    debugLog(`TIMER_FIRE: ${key} elapsed=${Math.round(elapsed/1000)}s`);
+    debugLog(`TIMER_FIRE: ${key} elapsed=${Math.round(elapsed / 1000)}s`);
+
+    // 检查通知上限
+    task.notifyCount = (task.notifyCount || 0) + 1;
+    if (task.notifyCount >= (cfg.maxStaleNotifyCount || 10)) {
+      debugLog(`TIMER_MAX_NOTIFY: ${key} reached limit ${task.notifyCount}`);
+      const notifyTarget = getNotifyTarget(task);
+      const label = task.label || task.childSessionKey;
+      sendFeishuNotification(
+        notifyTarget, "🗑️", "任务通知已达到上限",
+        `${label}\n已发送 ${task.notifyCount} 次停滞通知，自动清理`,
+        `max-notify:${key}`
+      );
+      cleanupTask(key);
+      return;
+    }
+
     staleNotify(task, elapsed, signalDir);
     try { runtime?.system?.requestHeartbeatNow?.(); } catch {}
   }, timeoutMs).unref();
@@ -144,7 +150,22 @@ function resetTimer(key, timeoutMs, signalDir) {
   startTimer(key, timeoutMs, signalDir);
 }
 
-// 从 before_tool_call event 提取 exec 命令
+function cleanupTask(key) {
+  const task = tasks.get(key);
+  if (!task) return;
+  clearTimeout(task.timer);
+  tasks.delete(key);
+  debugLog(`CLEANUP: ${key}`);
+  try {
+    const trace = loadTrace();
+    if (trace[key]) {
+      trace[key].endedAt = Date.now();
+      trace[key].outcome = "auto_cleaned";
+      saveTrace(trace);
+    }
+  } catch {}
+}
+
 function extractExecCommand(event) {
   try {
     const params = event?.params ?? {};
@@ -153,7 +174,6 @@ function extractExecCommand(event) {
   } catch { return ""; }
 }
 
-// 从 before_tool_call params 检测是否为后台 exec
 function isBackgroundExec(event) {
   try {
     const params = event?.params ?? {};
@@ -167,22 +187,35 @@ module.exports = {
 
     runtime = api.runtime;
     cfg = api.pluginConfig ?? {};
-    const timeoutMs = cfg.staleTimeoutMs ?? 300000;
+    const timeoutMs = cfg.staleTimeoutMs ?? 300000; // 5分钟
     const signalDir = cfg.signalDir ?? "~/.openclaw/workspace/data/signals";
     const execTimeoutMs = cfg.execStaleTimeoutMs ?? timeoutMs;
 
-    debugLog(`PLUGIN_LOADED: progress-monitor v1.2 (with direct feishu notification, default user=${cfg?.userOpenId || "none"})`);
+    debugLog(`PLUGIN_LOADED: progress-monitor v1.3 (async notify, max_count=${cfg.maxStaleNotifyCount || 10}, default user=${cfg?.userOpenId || "none"})`);
 
-    // gateway_start: 恢复未完成任务
+    // gateway_start: 恢复未完成任务（带过期清理）
     api.on("gateway_start", (event, ctx) => {
       debugLog("GATEWAY_START");
       try {
         const trace = loadTrace();
+        const maxAge = timeoutMs * 3; // 超过3倍超时时间的任务直接丢弃
+        const now = Date.now();
+        let cleaned = 0;
         for (const [key, t] of Object.entries(trace)) {
           if (t.endedAt) continue;
-          tasks.set(key, { ...t, timer: null, startTime: t.startTime ?? Date.now() });
+          const age = now - (t.startTime ?? now);
+          if (age > maxAge) {
+            trace[key].endedAt = now;
+            trace[key].outcome = "expired_on_restart";
+            cleaned++;
+            debugLog(`GATEWAY_EXPIRED: ${key} age=${Math.round(age / 60000)}min > maxAge=${Math.round(maxAge / 60000)}min`);
+            continue;
+          }
+          tasks.set(key, { ...t, timer: null, startTime: t.startTime ?? now });
           startTimer(key, timeoutMs, signalDir);
         }
+        if (cleaned > 0) saveTrace(trace);
+        debugLog(`GATEWAY_RESTORED: ${tasks.size} tasks, expired ${cleaned}`);
       } catch {}
     });
 
@@ -199,15 +232,16 @@ module.exports = {
           requesterSessionKey: ctx?.requesterSessionKey,
           startTime: Date.now(),
           timer: null,
+          notifyCount: 0,
         };
         tasks.set(key, task);
         startTimer(key, timeoutMs, signalDir);
-        debugLog(`SUBAGENT_SPAWNED: ${key} label=${task.label} requester=${task.requesterSessionKey}`);
+        debugLog(`SUBAGENT_SPAWNED: ${key} label=${task.label}`);
         const trace = loadTrace();
         trace[key] = { ...task, timer: undefined };
         saveTrace(trace);
 
-        // Auto-register with task-coordinator (task_tracker.py init)
+        // Auto-register with task-coordinator
         try {
           const trackerScript = path.join(
             os.homedir(), ".openclaw/workspace/skills/task-coordinator/scripts/task_tracker.py"
@@ -216,14 +250,11 @@ module.exports = {
           const goal = task.label || `Subagent: ${event.agentId}`;
           const agent = event.agentId || "main";
           const requester = task.requesterSessionKey || "";
-          const initCmd = [
-            "python3", trackerScript, "init", taskId, goal, agent,
-            "--requester", requester,
-          ];
-          const initResult = execSync(initCmd.map(c => `'${c}'`).join(" "), {
-            timeout: 5000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
-          });
-          debugLog(`TASK_TRACKER_INIT: ${taskId} result=${initResult.trim()}`);
+          execSync(
+            ["python3", trackerScript, "init", taskId, goal, agent, "--requester", requester].map(c => `'${c}'`).join(" "),
+            { timeout: 5000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
+          );
+          debugLog(`TASK_TRACKER_INIT: ${taskId}`);
         } catch (e) {
           debugLog(`TASK_TRACKER_INIT_FAIL: ${key} error=${e.message?.slice(0, 200)}`);
         }
@@ -245,10 +276,7 @@ module.exports = {
     api.on("subagent_ended", (event, ctx) => {
       try {
         const key = event.targetSessionKey;
-        const task = tasks.get(key);
-        clearTimeout(task?.timer);
-        tasks.delete(key);
-        debugLog(`SUBAGENT_ENDED: ${key}`);
+        cleanupTask(key);
         const trace = loadTrace();
         if (trace[key]) {
           trace[key].endedAt = event.endedAt ?? Date.now();
@@ -256,93 +284,135 @@ module.exports = {
           saveTrace(trace);
         }
 
-        // Notify task-coordinator (complete/fail)
         try {
           const trackerScript = path.join(
             os.homedir(), ".openclaw/workspace/skills/task-coordinator/scripts/task_tracker.py"
           );
           const taskId = key.replace(/[^a-zA-Z0-9._-]/g, "_");
-          const duration = task ? Date.now() - task.startTime : 0;
           const outcome = event.outcome || "completed";
           const isFail = outcome.includes("fail") || outcome.includes("error") || outcome.includes("timeout");
           const cmd = isFail
-            ? `python3 '${trackerScript}' fail '${taskId}' 'Subagent ended: ${outcome}' --duration ${duration}`
-            : `python3 '${trackerScript}' complete '${taskId}' --output 'Subagent ended: ${outcome}' --duration ${duration}`;
-          const result = execSync(cmd, {
-            timeout: 5000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
-          });
-          debugLog(`TASK_TRACKER_${isFail ? "FAIL" : "COMPLETE"}: ${taskId} duration=${duration}ms result=${result.trim()}`);
+            ? `python3 '${trackerScript}' fail '${taskId}' 'Subagent ended: ${outcome}'`
+            : `python3 '${trackerScript}' complete '${taskId}' --output 'Subagent ended: ${outcome}'`;
+          execSync(cmd, { timeout: 5000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
+          debugLog(`TASK_TRACKER_${isFail ? "FAIL" : "COMPLETE"}: ${taskId}`);
         } catch (e) {
           debugLog(`TASK_TRACKER_END_FAIL: ${key} error=${e.message?.slice(0, 200)}`);
         }
       } catch {}
     });
 
-    // ========== Claude Code 进度监控（ACP Hooks 文件监听） ==========
+    // ========== Claude Code 进度监控（改进版） ==========
     const claudeProgressDir = expandDir(cfg.claudeProgressDir ?? "~/.openclaw/workspace/data/claude-progress");
-    const claudeStaleTimeoutMs = cfg.claudeStaleTimeoutMs ?? 300000;
-    const claudeNotifyIntervalMs = cfg.claudeNotifyIntervalMs ?? 60000;
-    const claudeSessions = new Map(); // childSessionKey -> { lastNotify, lastTool, startTime }
+    const claudeStaleTimeoutMs = cfg.claudeStaleTimeoutMs ?? 600000; // 10分钟
+    const claudeNotifyIntervalMs = cfg.claudeNotifyIntervalMs ?? 300000; // 5分钟
+    const CLAUDE_MAX_NOTIFY = cfg.claudeMaxNotifyCount || 10;
+    const CLAUDE_FILE_MAX_AGE = 1800000; // 30分钟无更新自动清理
+    let claudeSessions = new Map(); // sessionId -> { lastNotify, notifyCount, lastFileUpdate }
+    let claudeFsWatcher = null;
 
-    try {
-      if (fs.existsSync(claudeProgressDir)) {
-        fs.watch(claudeProgressDir, (eventType, filename) => {
-          if (!filename || !filename.endsWith("_latest.json")) return;
+    function isClaudeEnded(latest) {
+      // Claude hooks 写入 session_end 表示会话结束
+      if (latest.event === "session_end" || latest.event === "session_end_error") return true;
+      // 没有活跃工具且没有活跃事件
+      if (!latest.tool && !latest.event) return true;
+      return false;
+    }
+
+    function claudeEndCleanup(sessionId, reason) {
+      claudeSessions.delete(sessionId);
+      const latestPath = path.join(claudeProgressDir, `${sessionId}_latest.json`);
+      try {
+        if (fs.existsSync(latestPath)) {
+          fs.unlinkSync(latestPath);
+          debugLog(`CLAUDE_CLEANUP: ${sessionId} ${reason}, file deleted`);
+        }
+      } catch {}
+    }
+
+    function checkClaudeProgress() {
+      try {
+        if (!fs.existsSync(claudeProgressDir)) return;
+        const files = fs.readdirSync(claudeProgressDir).filter(f => f.endsWith("_latest.json"));
+        const now = Date.now();
+
+        for (const file of files) {
+          const sessionId = file.replace("_latest.json", "");
+          const latestPath = path.join(claudeProgressDir, file);
           try {
-            const filePath = path.join(claudeProgressDir, filename);
-            const content = fs.readFileSync(filePath, "utf-8");
-            if (!content.trim()) return;
-            const data = JSON.parse(content);
-            const sessionId = filename.replace("_latest.json", "");
-            debugLog(`CLAUDE_PROGRESS: ${sessionId} ${data.tool ? data.tool + ": " : ""}${(data.input || "").slice(0, 80)}`);
+            const latest = JSON.parse(fs.readFileSync(latestPath, "utf-8"));
+            const elapsed = now - latest.timestamp;
 
-            // Check if this session is tracked as a Claude ACP session
-            let tracked = false;
-            for (const [key, info] of claudeSessions) {
-              if (key.includes(sessionId.slice(0, 8))) {
-                info.lastTool = `${data.event}: ${data.tool || ""} ${data.input || ""}`.trim();
-                const now = Date.now();
-                if (now - info.lastNotify > claudeNotifyIntervalMs) {
-                  info.lastNotify = now;
-                  const label = info.label || sessionId;
-                  const notifyTarget = getNotifyTarget({ requesterSessionKey: info.requesterSessionKey });
-                  sendFeishuNotification(notifyTarget, "\uD83D\uDC9D", "Claude 进度", `${label}\n${info.lastTool}`);
-                }
-                tracked = true;
-                break;
+            // 检查 Claude 是否已结束
+            if (isClaudeEnded(latest)) {
+              claudeEndCleanup(sessionId, "session_ended");
+              continue;
+            }
+
+            // 超过30分钟文件没更新，自动清理
+            if (!claudeSessions.has(sessionId)) {
+              claudeSessions.set(sessionId, { lastNotify: 0, notifyCount: 0, lastFileUpdate: now });
+            }
+            const session = claudeSessions.get(sessionId);
+            if (now - (session.lastFileUpdate || 0) > CLAUDE_FILE_MAX_AGE) {
+              claudeEndCleanup(sessionId, "file_expired");
+              continue;
+            }
+            session.lastFileUpdate = now;
+
+            // 通知限频：5分钟一次
+            if (now - session.lastNotify < claudeNotifyIntervalMs) continue;
+
+            // 通知上限检查
+            if (session.notifyCount >= CLAUDE_MAX_NOTIFY) {
+              // 只发一次上限通知
+              if (session.notifyCount === CLAUDE_MAX_NOTIFY) {
+                session.notifyCount++;
+                sendFeishuNotification(
+                  `user:${cfg?.userOpenId || ""}`, "🗑️", "Claude 通知已达到上限",
+                  `会话 ${sessionId.slice(0, 8)}... 已发送 ${CLAUDE_MAX_NOTIFY} 次通知，自动清理`,
+                  `claude-max-notify:${sessionId}`
+                );
+                claudeEndCleanup(sessionId, "max_notify_reached");
               }
+              continue;
+            }
+
+            // 发进度通知
+            const toolSummary = latest.tool
+              ? `${latest.tool}: ${(latest.input || "").slice(0, 50)}`
+              : latest.event || "unknown";
+            const notifyTarget = `user:${cfg?.userOpenId || ""}`;
+            if (cfg?.userOpenId) {
+              sendFeishuNotification(notifyTarget, "🔧", "Claude 进度",
+                `${toolSummary}\n已运行 ${Math.round(elapsed / 1000)}秒`,
+                `claude-progress:${sessionId}`
+              );
+              session.lastNotify = now;
+              session.notifyCount++;
+              debugLog(`CLAUDE_PROGRESS: ${sessionId} ${toolSummary} (notify #${session.notifyCount})`);
+            }
+
+            // 停滞检测：超过10分钟
+            if (elapsed >= claudeStaleTimeoutMs && cfg?.userOpenId) {
+              sendFeishuNotification(notifyTarget, "⚠️", "Claude 可能卡住",
+                `${toolSummary}\n已停滞 ${Math.round(elapsed / 60000)}分钟`,
+                `claude-stale:${sessionId}`
+              );
             }
           } catch (e) {
-            debugLog(`CLAUDE_READ_FAIL: ${e.message?.slice(0, 100)}`);
+            debugLog(`CLAUDE_READ_FAIL: ${file} ${e.message?.slice(0, 100)}`);
           }
-        });
-        debugLog(`CLAUDE_FS_WATCH_ENABLED: ${claudeProgressDir}`);
-      } else {
-        debugLog(`CLAUDE_FS_WATCH_SKIP: ${claudeProgressDir} not found (Claude not installed or hooks not configured)`);
-      }
-    } catch (e) {
-      debugLog(`CLAUDE_SETUP_FAIL: ${e.message?.slice(0, 100)}`);
-    }
-
-    // Check Claude ACP sessions periodically for staleness
-    function checkClaudeProgress() {
-      const now = Date.now();
-      for (const [key, info] of claudeSessions) {
-        if (now - info.lastNotify > claudeStaleTimeoutMs && info.lastTool) {
-          info.lastNotify = now;
-          const label = info.label || key;
-          const elapsed = Math.round((now - info.startTime) / 60000);
-          const notifyTarget = getNotifyTarget({ requesterSessionKey: info.requesterSessionKey });
-          sendFeishuNotification(notifyTarget, "\u26A0\uFE0F", "Claude 停滞", `${label}\n${elapsed} 分钟无新进展\n最后: ${info.lastTool}`);
         }
+      } catch (e) {
+        debugLog(`CLAUDE_CHECK_FAIL: ${e.message?.slice(0, 100)}`);
       }
     }
-    const claudeCheckInterval = setInterval(checkClaudeProgress, 60000).unref();
 
     // ACP session 关联 Claude 进度
     api.on("subagent_spawned", (event, ctx) => {
       if (event.agentId !== "claude" && !(event.agentId && event.agentId.includes("claude"))) return;
-      claudeSessions.set(event.childSessionKey, { lastNotify: 0, lastTool: "", startTime: Date.now(), label: event.label, requesterSessionKey: ctx?.requesterSessionKey });
+      claudeSessions.set(event.childSessionKey, { lastNotify: 0, notifyCount: 0, lastFileUpdate: Date.now() });
       debugLog(`CLAUDE_ACP_START: ${event.childSessionKey}`);
       checkClaudeProgress();
     });
@@ -350,9 +420,24 @@ module.exports = {
     api.on("subagent_ended", (event, ctx) => {
       const key = event.targetSessionKey;
       if (!claudeSessions.has(key)) return;
-      claudeSessions.delete(key);
-      debugLog(`CLAUDE_ACP_END: ${key}`);
+      claudeEndCleanup(key, "subagent_ended");
     });
+
+    // fs.watch 监听 Claude 进度文件
+    try {
+      if (fs.existsSync(claudeProgressDir)) {
+        claudeFsWatcher = fs.watch(claudeProgressDir, (eventType, filename) => {
+          if (!filename?.endsWith("_latest.json")) return;
+          debugLog(`CLAUDE_FILE_CHANGED: ${filename} ${eventType}`);
+          checkClaudeProgress();
+        });
+        debugLog(`CLAUDE_FS_WATCH_ENABLED: ${claudeProgressDir}`);
+      } else {
+        debugLog(`CLAUDE_FS_WATCH_SKIP: ${claudeProgressDir} not found`);
+      }
+    } catch (e) {
+      debugLog(`CLAUDE_FS_WATCH_FAIL: ${e.message?.slice(0, 100)}`);
+    }
 
     // ========== Exec 长任务监控 ==========
     api.on("before_tool_call", (event, ctx) => {
@@ -378,25 +463,36 @@ module.exports = {
           startTime: Date.now(),
           timer: null,
           command,
+          notifyCount: 0,
         };
         tasks.set(key, task);
-        debugLog(`EXEC_BEFORE: ${key} cmd=${command.slice(0, 50)} requester=${sessionKey}`);
+        debugLog(`EXEC_BEFORE: ${key} cmd=${command.slice(0, 50)}`);
         const trace = loadTrace();
         trace[key] = { ...task, timer: undefined, status: "pending" };
         saveTrace(trace);
       } catch {}
     });
 
-    // after_tool_call: 确认后台 exec 启动，开始计时
+    // after_tool_call: 标记旧的 exec 为 completed，启动新的 timer
     api.on("after_tool_call", (event, ctx) => {
       try {
         if (event?.toolName !== "exec") return;
         const sessionKey = ctx?.sessionKey ?? "unknown";
+
+        // 标记同 session 下所有旧的 running exec 为 completed
+        for (const [k, t] of tasks) {
+          if (t.type === "exec" && t.sessionKey === sessionKey && t.status === "running") {
+            t.status = "completed";
+            clearTimeout(t.timer);
+            debugLog(`EXEC_OLD_COMPLETED: ${k}`);
+          }
+        }
+
+        // 找到最新的 pending exec 并启动
         let foundKey = null;
         for (const [k, t] of tasks) {
-          if (t.type === "exec" && t.sessionKey === sessionKey && t.status !== "completed") {
+          if (t.type === "exec" && t.sessionKey === sessionKey && t.status === "pending") {
             foundKey = k;
-            break;
           }
         }
         if (!foundKey) {
@@ -404,13 +500,12 @@ module.exports = {
           return;
         }
         const task = tasks.get(foundKey);
-        startTimer(foundKey, execTimeoutMs, signalDir);
         task.status = "running";
+        startTimer(foundKey, execTimeoutMs, signalDir);
         debugLog(`EXEC_AFTER: ${foundKey} status=running, timer started (${execTimeoutMs}ms)`);
         const trace = loadTrace();
         if (trace[foundKey]) {
           trace[foundKey].status = "running";
-          trace[foundKey].timerStartedAt = Date.now();
           saveTrace(trace);
         }
       } catch {}
