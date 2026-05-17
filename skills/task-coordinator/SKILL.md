@@ -108,11 +108,23 @@ python3 skills/task-coordinator/scripts/task_tracker.py timeout "$TASK_ID" \
 
 用 `write` 工具创建：
 
+**① 先获取 sessionKey**：调用 `session_status` 工具，从返回的 `Session:` 行提取。
+
 ```
-path: data/task-traces/plan-{sanitized_sessionKey}.md
+🧵 Session: agent:main:openclaw-feishu:direct:ou_3fe124f0786a0d7da47d46191695efe4
 ```
 
-其中 sanitized_sessionKey = sessionKey 中 `:/\\` 替换为 `_`，取前 64 字符。
+**② sanitize**：将 `:/\\` 替换为 `_`，取前 64 字符：
+
+```
+agent:main:openclaw-feishu:direct:ou_xxx → agent_main_openclaw-feishu_direct_ou_xxx
+```
+
+**③ 创建文件**：
+
+```
+path: data/task-traces/plan-agent_main_openclaw-feishu_direct_ou_xxx.md
+```
 
 **文件格式：**
 ```markdown
