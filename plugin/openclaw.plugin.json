@@ -3,6 +3,12 @@
   "name": "Progress Monitor",
   "description": "Monitor subagent progress and notify on stale tasks",
   "version": "1.0.0",
+  "contracts": {
+    "hooks": ["subagent_spawned", "subagent_ended", "agent_end", "before_prompt_build", "before_tool_call", "after_tool_call", "gateway_start"]
+  },
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -35,17 +41,17 @@
       "claudeProgressDir": {
         "type": "string",
         "default": "~/.openclaw/workspace/data/claude-progress",
-        "description": "Claude Code progress files directory"
+        "description": "Claude Code hooks progress directory (optional, auto-skip if not exists)"
       },
       "claudeStaleTimeoutMs": {
         "type": "number",
-        "default": 300000,
-        "description": "Claude ACP session stale timeout in milliseconds (default: 5 min)"
+        "default": 120000,
+        "description": "Claude stale threshold in ms (default: 2 min)"
       },
       "claudeNotifyIntervalMs": {
         "type": "number",
         "default": 60000,
-        "description": "Minimum interval between Claude progress notifications (default: 1 min)"
+        "description": "Min interval between Claude progress notifications (default: 1 min)"
       }
     }
   }
